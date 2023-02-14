@@ -27,6 +27,9 @@ static std::condition_variable cv2;
 static bool working;
 static std::mutex mutex;
 
+
+
+
 class FulfillmentFailure : public std::exception
 {
   const char* what() const throw () {
@@ -115,15 +118,19 @@ private:
   std::vector<std::basic_string<char>> products;
 };
 
+
 class System {
   typedef std::unordered_map<std::string, std::shared_ptr<Machine>> machines_t;
   typedef std::vector<std::string> Order;
+  machines_t machines;
+  unsigned int numberOfWorkers;
+
 
 public:
   std::map <OrderId , WorkerId> orderAndWorker;
 
   System(machines_t machines, unsigned int numberOfWorkers, unsigned int clientTimeout) :
-  machines(machines), numberOfWorkers(numberOfWorkers), clientTimeout(clientTimeout)
+                                                                                          machines(machines), numberOfWorkers(numberOfWorkers), clientTimeout(clientTimeout)
 
   {
     working = true;
@@ -137,7 +144,7 @@ public:
       menu.push_back(machine.first);
     }
 
-    for (int i = 1; i <= numberOfWorkers; i++) {
+    for (WorkerId i = 1; i <= numberOfWorkers; i++) {
       workers[i] = std::thread([this, i]() { work(i);});
       busyWorkers[i] = false;
     }
@@ -238,7 +245,7 @@ public:
 
     cv.notify_all();
 
-    for (int i = 1; i <= numberOfWorkers; i++) {
+    for (WorkerId i = 1; i <= numberOfWorkers; i++) {
       workers[i].join();
     }
 
@@ -284,21 +291,21 @@ public:
 
 private:
   void handleBrokenMachine(OrderId orderId, WorkerId id, const std::string& productName, const Order &order) {
-     reports[id].failedOrders.push_back(order);
-     reports[id].failedProducts.push_back(productName);
-     fulfillmentFailure[orderId] = true;
-     brokenMachine[productName] = true;
+    reports[id].failedOrders.push_back(order);
+    reports[id].failedProducts.push_back(productName);
+    fulfillmentFailure[orderId] = true;
+    brokenMachine[productName] = true;
 
-     printf("Broken %d  on product %s size %ld\n", orderId, productName.c_str(), readyOrdersMap[orderId].size());
-     for (auto &p : readyOrdersMap[orderId]) {
-       if (p.second) {
-         machines[p.first]->returnProduct(std::move(p.second));
-       }
-     }
+    printf("Broken %d  on product %s size %ld\n", orderId, productName.c_str(), readyOrdersMap[orderId].size());
+    for (auto &p : readyOrdersMap[orderId]) {
+      if (p.second) {
+        machines[p.first]->returnProduct(std::move(p.second));
+      }
+    }
 
-     readyOrders.erase(orderId);
-     removeFromMenu(productName);
-   }
+    readyOrders.erase(orderId);
+    removeFromMenu(productName);
+  }
 
   Order chooseOrder(WorkerId id, OrderId orderId) {
     busyWorkers[id] = true;
@@ -332,17 +339,17 @@ private:
     }
   }
 
-  void workAdd(WorkerId id) {
-    while (working) {
-      waitForOrder(id);
-      if (!working) {
-        break;
-      }
-      if (!orders.empty()) {
-        handleOrder(id);
+    void workAdd(WorkerId id) {
+      while (working) {
+        waitForOrder(id);
+        if (!working) {
+          break;
+        }
+        if (!orders.empty()) {
+          handleOrder(id);
+        }
       }
     }
-  }
 
   void waitForOrder(WorkerId id) {
     std::unique_lock lk(mutex);
@@ -362,33 +369,29 @@ private:
     waitForCollecting(id, orderId, order);
   }
 
-//  std::shared_ptr<Product> makeProduct(std::string type) {
-//    std::shared_ptr<Machine> machine;
-//    auto machineIt = machines.at(type);
-//    auto product = machine->make();;
-//
-//    return product;
-//  }
 
   void processOrder(WorkerId id, OrderId orderId, std::vector<std::string> &order) {
+    std::map<std::string, std::future<std::unique_ptr<Product>>> futures;
     for (auto it = order.begin(); it < order.end(); it++) {
       std::string productName = *it;
       auto machine = machines.at(productName);
-      std::unique_ptr<Product> product;
-      std::vector<std::future<std::string>> futures;
+      futures[productName] = std::async([machine](){ return machine->getProduct(); });
+    }
 
+    std::vector<std::unique_ptr<Product>> products;
+    for (auto &f : futures) {
       try {
-        product = std::move(machine->getProduct());
-        handleProduct(id, orderId, productName, product, order);
-      } catch (MachineFailure failure) {
-        handleBrokenMachine(orderId, id, productName, order);
+        auto product = f.second.get();
+        products.push_back(std::move(product));
+        handleProduct(id, orderId, const_cast<std::string &>(f.first), product, order);
+      } catch (MachineFailure &failure) {
+        handleBrokenMachine(orderId, id, f.first, order);
         break;
-      } catch (MachineNotWorking mutex) {
-        handleNotWorkingMachine(orderId, id);
+      } catch (MachineNotWorking &mutex) {
+        handleNotWorkingMachine(orderId);
         break;
       }
     }
-
     addReadyOrder(orderId);
   }
 
@@ -401,7 +404,7 @@ private:
     readyOrdersMap[orderId].insert({productName, std::move(product)});
   }
 
-  void handleNotWorkingMachine(OrderId orderId, WorkerId id) {
+  void handleNotWorkingMachine(OrderId orderId) {
     fulfillmentFailure[orderId] = true;
     readyOrders.erase(orderId);
   }
@@ -409,7 +412,7 @@ private:
   void waitForCollecting(WorkerId id, OrderId orderId, std::vector<std::string> &order) {
     std::unique_lock lk(mutex);
     workerWaitForCollecting.wait(lk, [&id, this, &orderId] {
-      return (!busyWorkers[id] || timeOut(orderId) || !working);
+      return ((!busyWorkers[id]  || timeOut(orderId)) || !working);
     });
     checkTimeOut(id, orderId, order);
     lk.unlock();
@@ -422,8 +425,6 @@ private:
   }
 
   typedef  std::map<unsigned int, Order> OrderMap;
-  unsigned int numberOfWorkers;
-  machines_t machines;
   std::map<std::string, bool> brokenMachine;
   std::thread endOfWork;
   std::map<WorkerId , std::thread> workers;
@@ -441,6 +442,5 @@ private:
   std::condition_variable workerWaitForCollecting;
   std::map<WorkerId, WorkerReport> reports;
 };
-
 
 #endif // SYSTEM_HPP
